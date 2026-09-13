@@ -94,11 +94,11 @@ _ecs_reaper_started = False
 _ecs_reaper_lock = threading.Lock()
 
 
-# A task that is registered but not stopped, in task-lifecycle order. A
-# PENDING or ACTIVATING task already counts against a service's desired
-# capacity, so reconciliation must not launch a second one while its images
-# are still pulling.
-_PRE_STOP_STATUSES = ("PENDING", "ACTIVATING", "RUNNING")
+# A task that is registered but not stopped, in task-lifecycle order. A task in
+# any of the three starting states already counts against a service's desired
+# capacity, so reconciliation must not launch a second one while its network is
+# being provisioned or its images are still pulling.
+_PRE_STOP_STATUSES = ("PROVISIONING", "PENDING", "ACTIVATING", "RUNNING")
 
 
 def _live_container_ids():
@@ -1187,7 +1187,7 @@ def _build_task_containers(td, container_overrides):
 
 
 def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
-                       host_mode, ministack_net_ip):
+                       host_mode, ministack_net_ip, known_status="PENDING"):
     """Inject ECS_CONTAINER_METADATA_URI_V4 into env and register the
     container with the metadata server. Returns the token so the caller can
     record it on the task and update DockerId once the container starts.
@@ -1216,8 +1216,11 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
             "TaskARN": task_arn,
             "Family": td.get("family", ""),
             "Revision": str(td.get("revision", 1)),
+            # DesiredStatus is what RunTask asked for; KnownStatus is what the
+            # agent knows right now, which is not RUNNING while the image is
+            # still being pulled. _mark_task_running moves it.
             "DesiredStatus": "RUNNING",
-            "KnownStatus": "RUNNING",
+            "KnownStatus": known_status,
             "AvailabilityZone": f"{get_region()}a",
             "LaunchType": launch_type,
         },
@@ -1233,7 +1236,7 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
                 "com.amazonaws.ecs.cluster": cluster_arn,
             },
             "DesiredStatus": "RUNNING",
-            "KnownStatus": "RUNNING",
+            "KnownStatus": known_status,
             "Type": "NORMAL",
         },
     )
@@ -1475,6 +1478,7 @@ def _mark_task_activating(task_arn, task):
             return False
         task["lastStatus"] = "ACTIVATING"
         task["pullStartedAt"] = task.get("pullStartedAt") or _iso()
+    ecs_metadata.set_task_status(task_arn, "ACTIVATING")
 
     cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
     if cluster_name:
@@ -1494,6 +1498,7 @@ def _mark_task_running(task_arn, task):
         task["lastStatus"] = "RUNNING"
         task["pullStoppedAt"] = task.get("pullStoppedAt") or now
         task["startedAt"] = task.get("startedAt") or now
+    ecs_metadata.set_task_status(task_arn, "RUNNING")
 
     cluster_name = _cluster_name_from_arn(task.get("clusterArn", ""))
     if cluster_name:
@@ -1636,6 +1641,7 @@ def _start_task_worker(task, td, container_overrides, docker_client):
         metadata_token = _register_metadata(
             task_arn, cluster_arn, td, cdef, launch_type, env,
             host_mode, ministack_net_ip,
+            known_status=task.get("lastStatus", "PENDING"),
         )
         with resource_lock("ecs-task", task_arn):
             active = _task_is_active(task_arn, task)
@@ -1716,7 +1722,17 @@ def _run_task(data):
     req_tags = data.get("tags", [])
     docker_client = _get_docker()
     docker_backed = bool(docker_client)
-    initial_status = "PENDING" if docker_backed else "RUNNING"
+    # "PROVISIONING: Amazon ECS has to perform additional steps before the task
+    # is launched. For example, for tasks that use the awsvpc network mode, the
+    # elastic network interface needs to be provisioned" (task-lifecycle). Every
+    # other network mode starts PENDING, the state a task sits in while it waits
+    # for the agent to act.
+    if not docker_backed:
+        initial_status = "RUNNING"
+    elif td.get("networkMode") == "awsvpc":
+        initial_status = "PROVISIONING"
+    else:
+        initial_status = "PENDING"
 
     tasks = []
     failures = []

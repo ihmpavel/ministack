@@ -1565,6 +1565,120 @@ def test_ecs_run_task_returns_pending_before_docker_start(monkeypatch):
     assert described["containers"][0]["exitCode"] == 0
 
 
+def test_ecs_run_task_awsvpc_starts_provisioning_and_metadata_follows(monkeypatch):
+    """An awsvpc task starts PROVISIONING: "for tasks that use the awsvpc
+    network mode, the elastic network interface needs to be provisioned"
+    (task-lifecycle). The metadata endpoint reports the status the agent knows,
+    so it must not answer RUNNING while the image is still being pulled.
+    Reported by @iot-rocket."""
+    import threading
+
+    from ministack.services import ecs as _ecs
+    from ministack.services import ecs_metadata as _md
+
+    started = threading.Event()
+    release = threading.Event()
+    containers = {}
+
+    class FakeContainer:
+        def __init__(self, cid):
+            self.id = cid
+            self.status = "running"
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def reload(self):
+            pass
+
+        def wait(self):
+            return {"StatusCode": 0}
+
+        def stop(self, timeout=5):
+            self.status = "exited"
+
+        def remove(self, **kwargs):
+            pass
+
+    class FakeContainers:
+        def get(self, name):
+            if name in containers:
+                return containers[name]
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return list(containers.values())
+
+        def run(self, image, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            container = FakeContainer("awsvpc-test-container")
+            containers[container.id] = container
+            return container
+
+    monkeypatch.setattr(
+        _ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers())
+    )
+    _ecs._register_task_definition({
+        "family": "awsvpc-test-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "app", "image": "busybox"}],
+    })
+
+    response = _ecs._run_task({
+        "cluster": "awsvpc-test-c",
+        "taskDefinition": "awsvpc-test-td",
+    })
+    task = json.loads(response[2])["tasks"][0]
+    arn = task["taskArn"]
+    assert task["lastStatus"] == "PROVISIONING"
+
+    assert started.wait(timeout=2)
+    assert _ecs._tasks[arn]["lastStatus"] == "ACTIVATING"
+    # The endpoint answers what the agent knows, not a hardcoded RUNNING.
+    assert _md._TASKS[arn]["KnownStatus"] == "ACTIVATING"
+    assert _md._TASKS[arn]["DesiredStatus"] == "RUNNING"
+    assert all(c["KnownStatus"] == "ACTIVATING" for c in _md._TASKS[arn]["Containers"])
+
+    release.set()
+    _wait_until(lambda: _ecs._tasks[arn]["lastStatus"] == "RUNNING")
+    _wait_until(lambda: _md._TASKS[arn]["KnownStatus"] == "RUNNING")
+
+
+def test_ecs_run_task_bridge_mode_starts_pending(monkeypatch):
+    """Only awsvpc has a network interface to provision; every other mode
+    starts PENDING, where the task waits for the agent to act."""
+    import threading
+
+    from ministack.services import ecs as _ecs
+
+    release = threading.Event()
+
+    class FakeContainers:
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return []
+
+        def run(self, image, **kwargs):
+            assert release.wait(timeout=5)
+            raise RuntimeError("stopped by the test")
+
+    monkeypatch.setattr(
+        _ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers())
+    )
+    _ecs._register_task_definition({
+        "family": "bridge-test-td",
+        "networkMode": "bridge",
+        "containerDefinitions": [{"name": "app", "image": "busybox"}],
+    })
+    response = _ecs._run_task({
+        "cluster": "bridge-test-c",
+        "taskDefinition": "bridge-test-td",
+    })
+    assert json.loads(response[2])["tasks"][0]["lastStatus"] == "PENDING"
+    release.set()
+
+
 def test_ecs_run_task_startup_failure_is_a_stopped_task(monkeypatch):
     from ministack.services import ecs as _ecs
 

@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **ECS — a starting task reports `PROVISIONING` and `ACTIVATING`, and the metadata endpoint follows it** — a task was `PENDING` from `RunTask` until every container was up, so a consumer waiting for `ACTIVATING` waited forever and one reading `PENDING` as "no capacity yet" could not tell a queued task from one already pulling. An `awsvpc` task now starts `PROVISIONING`, where its network interface is provisioned, every other network mode starts `PENDING`, and the image pull happens in `ACTIVATING`. `${ECS_CONTAINER_METADATA_URI_V4}/task` reported a hard-coded `RUNNING` throughout, contradicting `DescribeTasks`; it now reports the status the agent knows, with `DesiredStatus` staying `RUNNING` as `RunTask` asked. Reported by @iot-rocket.
+
 ## [1.5.11] — 2026-09-13
 
 ### Added

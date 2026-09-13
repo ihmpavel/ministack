@@ -73,6 +73,23 @@ def set_docker_id(token: str, docker_id: str) -> None:
             container["DockerId"] = docker_id
 
 
+def set_task_status(task_arn: str, known_status: str) -> None:
+    """Track the task's real status on the metadata payload.
+
+    The endpoint reports what the agent knows, so a task still pulling its
+    image must not answer RUNNING while DescribeTasks reports PROVISIONING,
+    PENDING or ACTIVATING. DesiredStatus stays RUNNING: that is what RunTask
+    asked for, and only StopTask moves it.
+    """
+    with _LOCK:
+        task = _TASKS.get(task_arn)
+        if task is None:
+            return
+        task["KnownStatus"] = known_status
+        for container in task.get("Containers", []):
+            container["KnownStatus"] = known_status
+
+
 def reset() -> None:
     with _LOCK:
         _TASKS.clear()
