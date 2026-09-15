@@ -2280,9 +2280,14 @@ async def _dispatch_service_request(
 
     rds_no_docker_token = None
     rds_module = None
+    elasticache_no_docker_token = None
+    elasticache_module = None
     if headers.get("x-ministack-rds-no-docker", "").lower() in ("1", "true", "yes"):
         rds_module = _get_module("rds")
         rds_no_docker_token = rds_module._set_request_no_docker()
+    if headers.get("x-ministack-elasticache-no-docker", "").lower() in ("1", "true", "yes"):
+        elasticache_module = _get_module("elasticache")
+        elasticache_no_docker_token = elasticache_module._set_request_no_docker()
     try:
         status, resp_headers, resp_body = await handler(method, path, headers, body, query_params)
     except Exception as e:
@@ -2295,6 +2300,8 @@ async def _dispatch_service_request(
     finally:
         if rds_no_docker_token is not None:
             rds_module._reset_request_no_docker(rds_no_docker_token)
+        if elasticache_no_docker_token is not None:
+            elasticache_module._reset_request_no_docker(elasticache_no_docker_token)
 
     _maybe_record_cloudtrail(service, method, path, headers, body, query_params, request_id, region)
 

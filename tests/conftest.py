@@ -307,6 +307,12 @@ _RDS_DOCKER_TESTS = {
     "tests/test_rds.py::test_aurora_pg_replicating_reader_live",
     "tests/test_rds.py::test_aurora_pg_failover_promotes_data_plane",
 }
+_ELASTICACHE_TEST_FILES = {
+    "tests/test_elasticache.py",
+}
+_ELASTICACHE_DOCKER_TESTS = {
+    "tests/test_elasticache.py::test_elasticache_lambda_network_connectivity",
+}
 
 
 def pytest_configure(config):
@@ -318,6 +324,14 @@ def pytest_configure(config):
         "markers",
         "rds_no_docker: send RDS requests through the control-plane-only path",
     )
+    config.addinivalue_line(
+        "markers",
+        "elasticache_no_docker: send ElastiCache requests through the control-plane-only path",
+    )
+    config.addinivalue_line(
+        "markers",
+        "elasticache_docker: historical ElastiCache Docker test marker",
+    )
 
 def pytest_collection_modifyitems(config, items):
     for item in items:
@@ -327,6 +341,15 @@ def pytest_collection_modifyitems(config, items):
         test_file = nodeid.split("::", 1)[0]
         if test_file in _RDS_TEST_FILES and nodeid not in _RDS_DOCKER_TESTS:
             item.add_marker("rds_no_docker")
+        if test_file in _ELASTICACHE_TEST_FILES and nodeid not in _ELASTICACHE_DOCKER_TESTS:
+            item.add_marker("elasticache_no_docker")
+        if (
+            nodeid in _ELASTICACHE_DOCKER_TESTS
+            and not os.environ.get("DOCKER_NETWORK")
+        ):
+            item.add_marker(pytest.mark.skip(
+                reason="DOCKER_NETWORK not set - skipping ElastiCache Docker test"
+            ))
 
 
 @pytest.fixture(autouse=True)
@@ -341,6 +364,25 @@ def _rds_no_docker_requests(request, monkeypatch):
 
     def make_request(self, operation_model, request_dict):
         request_dict.setdefault("headers", {})["X-MiniStack-RDS-No-Docker"] = "true"
+        return real_make_request(self, operation_model, request_dict)
+
+    monkeypatch.setattr(Endpoint, "make_request", make_request)
+
+
+@pytest.fixture(autouse=True)
+def _elasticache_no_docker_requests(request, monkeypatch):
+    """Add the ElastiCache no-Docker header only for this test's requests."""
+    if not request.node.get_closest_marker("elasticache_no_docker"):
+        return
+
+    from botocore.endpoint import Endpoint
+
+    real_make_request = Endpoint.make_request
+
+    def make_request(self, operation_model, request_dict):
+        request_dict.setdefault("headers", {})[
+            "X-MiniStack-ElastiCache-No-Docker"
+        ] = "true"
         return real_make_request(self, operation_model, request_dict)
 
     monkeypatch.setattr(Endpoint, "make_request", make_request)
