@@ -348,11 +348,8 @@ def test_iot_create_keys_and_certificate_active(iot_client):
 
 
 def test_iot_create_keys_and_certificate_is_rsa_2048(iot_client):
-    """AWS issues an RSA-2048 key pair, so the Local CA does too.
-
-    The CA's own key is P-256 (RSA keygen holds the GIL on the boot path),
-    which is invisible on the wire; what the device gets is not.
-    """
+    """AWS issues an RSA-2048 key pair: "Creates a 2048-bit RSA key pair and
+    issues an X.509 certificate" (CreateKeysAndCertificate)."""
     crypto_serialization = pytest.importorskip(
         "cryptography.hazmat.primitives.serialization"
     )
