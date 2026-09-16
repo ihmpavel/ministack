@@ -272,7 +272,7 @@ class _ErrorModule:
         # run persisted, losing every resource the service held.
         return None
 
-    def restore_state(self, data):
+    def _restore_state(self, data):
         pass
 
     def load_persisted_state(self, data):
@@ -1502,8 +1502,9 @@ def _parse_execute_api_url(host: str, path: str) -> tuple[str, str, str] | None:
 
 
 def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str,
-                         headers: dict, query_params: dict):
-    """Authorize an execute-api invoke against its own ARN.
+                         headers: dict, query_params: dict,
+                         iam_action: str = "execute-api:Invoke"):
+    """Authorize an execute-api call against its own ARN.
 
     ``arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<METHOD>/<path>``,
     the shape AWS documents. Without it every invoke was authorized against
@@ -1513,12 +1514,16 @@ def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str
 
     Built by the same helper the Lambda authorizer's method ARN uses, because
     a policy has to match both.
+
+    ``iam_action`` is ``execute-api:Invoke`` for a normal request and
+    ``execute-api:ManageConnections`` for the WebSocket ``@connections`` API,
+    which AWS authorizes under that separate action.
     """
     from ministack.core.arn import execute_api_arn
     from ministack.core.responses import get_account_id
 
     return _enforce_data_plane(
-        "apigateway", "execute-api:Invoke", headers, query_params, "",
+        "apigateway", iam_action, headers, query_params, "",
         resource_arn=execute_api_arn(
             extract_region(headers, query_params), get_account_id(),
             api_id, stage, method, execute_path,
@@ -1619,7 +1624,12 @@ async def _handle_execute_api_request(
             logger.exception("Error resolving the execute-api stage: %s", e)
             return 500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()
 
-    denied = _enforce_execute_api(api_id, stage, method, execute_path, headers, query_params)
+    # AWS authorizes the @connections API under execute-api:ManageConnections,
+    # a separate action that execute-api:Invoke does not carry.
+    denied = _enforce_execute_api(
+        api_id, stage, method, execute_path, headers, query_params,
+        iam_action="execute-api:ManageConnections" if connections else "execute-api:Invoke",
+    )
     if denied:
         return denied
 
@@ -1674,6 +1684,39 @@ def _parse_lambda_url(host: str, path: str) -> tuple[str, str] | None:
     return None
 
 
+def _function_url_auth_target(url_id: str) -> tuple[str, dict, tuple | None]:
+    """Resolve a Function URL id to what its invoke is authorized against.
+
+    Returns the resource ARN, the request's condition keys, and the raw
+    resolution (``None`` if the id did not resolve), which the handler reuses
+    to serve the request.
+
+    AWS evaluates ``lambda:InvokeFunctionUrl`` on the function ARN, qualifier
+    included, which is the resource the CDK's ``grantInvokeUrl`` names. Without
+    this the invoke was checked against ``*`` and no scoped grant could match.
+
+    ``lambda:FunctionUrlAuthType`` is the URL's own ``AuthType``, and the same
+    method conditions its grant on it, so the resource alone is not enough: an
+    unresolved key makes a condition false and the statement still would not
+    match. ``lambda:InvokedViaFunctionUrl`` is deliberately not supplied. It
+    restricts ``lambda:InvokeFunction`` only, and AWS denies an
+    ``InvokeFunctionUrl`` grant conditioned on it even when the invoke did come
+    through a Function URL.
+
+    An id that resolves to nothing keeps ``*`` and no keys. The lookup runs
+    before the caller is authorized, so it must report nothing about which URLs
+    exist.
+    """
+    resolved = _get_module("lambda_svc").resolve_function_url(url_id)
+    if resolved is None:
+        return "*", {}, None
+    account_id, region, func_name, qualifier, cfg = resolved
+    function_arn = f"arn:aws:lambda:{region}:{account_id}:function:{func_name}"
+    if qualifier:
+        function_arn = f"{function_arn}:{qualifier}"
+    return function_arn, {"lambda:FunctionUrlAuthType": cfg.get("AuthType", "AWS_IAM")}, resolved
+
+
 async def _handle_lambda_url_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
     """Handle Lambda Function URL data plane requests (Host-based + path-based)."""
     parsed = _parse_lambda_url(host, path)
@@ -1681,13 +1724,18 @@ async def _handle_lambda_url_request(host: str, path: str, method: str, headers:
         return None
     url_id, function_path = parsed
 
-    denied = _enforce_data_plane("lambda", "lambda:InvokeFunctionUrl", headers, query_params, "")
+    resource_arn, service_context, resolved = _function_url_auth_target(url_id)
+    denied = _enforce_data_plane(
+        "lambda", "lambda:InvokeFunctionUrl", headers, query_params, "",
+        resource_arn=resource_arn, service_context=service_context,
+    )
     if denied:
         return denied
 
     try:
+        # The handler reuses the lookup above; None makes it resolve again.
         return await _get_module("lambda_svc").handle_function_url_request(
-            url_id, method, function_path, headers, body, query_params
+            url_id, method, function_path, headers, body, query_params, resolved=resolved,
         )
     except Exception as e:
         logger.exception("Error in Lambda Function URL dispatch: %s", e)
@@ -1859,16 +1907,23 @@ def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = Fa
 
 
 def _enforce_data_plane(
-    service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*"
+    service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*",
+    service_context: dict | None = None,
 ):
-    """Enforce IAM auth on a data-plane path. Returns error tuple or None."""
+    """Enforce IAM auth on a data-plane path. Returns error tuple or None.
+
+    ``service_context`` carries the request's own condition keys, for a path
+    that has them. The generic router resolves those itself; a data-plane
+    handler has to pass them, because it knows the resource the router does not.
+    """
     if not AUTH:
         return None
     from ministack.core.iam_actions import access_denied_response
     from ministack.core.iam_evaluator import AuthError, enforce
 
     access_key = extract_access_key_id(headers, query_params)
-    denied = enforce(access_key, iam_action, service, extract_region(headers, query_params), resource_arn=resource_arn)
+    denied = enforce(access_key, iam_action, service, extract_region(headers, query_params),
+                     resource_arn=resource_arn, service_context=service_context)
     if denied:
         if isinstance(denied, AuthError):
             return access_denied_response(
@@ -2732,102 +2787,18 @@ def _build_persistence_save_dict():
 
 
 def _load_persisted_state():
-    """Load persisted state for services that support it."""
-    for svc_key in ("apigateway", "apigateway_v1", "servicediscovery"):
-        data = load_state(svc_key)
+    """Restore every saved service through the registry's uniform contract."""
+    for state_key, module_name in _state_map.items():
+        data = load_state(state_key)
         if data:
-            _get_module(svc_key).load_persisted_state(data)
-            logger.info("Loaded persisted state for %s", svc_key)
-
-    # Eagerly import persisted services whose restore path depends on a
-    # module-level `load_state()` side-effect, but which would not otherwise
-    # be imported during startup. Their registry declarations ensure they are
-    # saved and reset; the lazy router still does not pull them in early enough
-    # in these cases:
-    #   - `ses_v2` is reached via the `/v2/email/*` path-prefix shortcut.
-    #   - `pipes` is commonly created via CloudFormation provisioners, without
-    #     a preceding Pipes API request.
-    #   - `appsync_events` is routable (SERVICE_REGISTRY has
-    #     "appsync-events") but real traffic arrives under the
-    #     `appsync` credential scope at `/v2/apis`, so the
-    #     `appsync-events` lazy handler never fires; the module is
-    #     reached only via a sibling import from `appsync.py`, which
-    #     bypasses `_get_module` and leaves it out of
-    #     `_loaded_modules` → shutdown skips persistence (#704).
-    #   - `apigateway_v1` is restored above only when a state file
-    #     already exists; on first-ever boot the conditional skips
-    #     it, the module is reached only via `apigateway.py`'s
-    #     sibling import (line 237), and the first save is silently
-    #     dropped. Same bug class as #704.
-    # Importing here triggers the module-level restore (and, for
-    # `pipes`, also restarts the background poller for any RUNNING
-    # pipe). Keep this list narrow — every entry costs a cold-start
-    # import.
-    for svc_key in ("pipes", "ses_v2", "appsync_events", "apigateway_v1"):
-        _get_module(svc_key)
-
-    # RDS is intentionally NOT in the unconditional list above —
-    # eager-importing it for every user would pull in ~13 MB of module
-    # objects (and, lazily, the docker SDK) even on stacks that don't
-    # use RDS. Instead, only eager-import when a persisted state file
-    # exists: importing the module triggers its bottom-of-file
-    # `load_state("rds")` which spawns the respawn threads for every
-    # persisted instance. Without this, users have to make one client
-    # call after every restart to lazily trigger the import + respawn
-    # (#692 follow-up after doodaz's confirmation).
-    if load_state("rds"):
-        _get_module("rds")
-        logger.info("RDS: eager-loaded module to respawn persisted containers at boot")
-
-    # OpenSearch has a routable management endpoint, but persisted domains must
-    # restore before the first request because restore_state() also recreates
-    # data-plane endpoints/containers. Waiting for the lazy router leaves a
-    # warm-boot window where DescribeDomain/ListDomainNames see empty state and
-    # data-plane traffic has no restored endpoint. Match RDS' conditional shape
-    # so stacks that do not persist OpenSearch pay no cold-start import cost.
-    if load_state("opensearch"):
-        _get_module("opensearch")
-        logger.info("OpenSearch: eager-loaded module to restore persisted domains")
-
-    # `lambda_durable` is reached only via `lambda_svc.handle_request`, never
-    # directly through the lazy router (no SERVICE_REGISTRY entry — it has no
-    # AWS endpoint of its own). Without an eager import at boot, persisted
-    # durable executions silently disappear until something happens to invoke
-    # a durable endpoint. Same conditional-import pattern as RDS — only pay
-    # the cold-start cost when state actually exists.
-    if load_state("lambda_durable"):
-        _get_module("lambda_durable")
-        logger.info("Lambda Durable: eager-loaded module to restore persisted executions")
-
-    # Lambda event source mappings (SQS / Kinesis / DynamoDB Streams) are
-    # polled by a background thread that lambda_svc starts from its
-    # import-time restore (`_ensure_poller`). lambda_svc is otherwise imported
-    # lazily on the first Lambda request — so after a persisted restart a
-    # workload that is pure SQS (just sending to a mapped queue) never imports
-    # the module, the poller never starts, and the restored ESM sits
-    # Enabled-but-unpolled while messages pile up (#889). Eager-import at boot
-    # when persisted ESMs exist so polling resumes exactly like a fresh
-    # CreateEventSourceMapping. Narrow: only pay the cold-start when there are
-    # mappings to poll. The `_data` reach gets all accounts' ESMs (the bool of
-    # an AccountScopedDict is account-scoped and would be 0 with no request
-    # context at boot).
-    _lam = load_state("lambda")
-    if _lam and getattr(_lam.get("esms"), "_data", _lam.get("esms")):
-        _get_module("lambda_svc")  # module file is lambda_svc.py (lambda is a keyword)
-        logger.info("Lambda: eager-loaded module to resume event-source-mapping pollers at boot")
-
-    # ECS services are restored with every task marked STOPPED — their
-    # containers went with the previous process — and the relaunch happens on
-    # the module's import-time restore hook. ECS is otherwise imported lazily on
-    # the first ECS request, so a workload that only talks to the service
-    # through a load balancer never triggers it: the service reports its
-    # persisted runningCount, nothing is running, and every request through the
-    # balancer fails. Same conditional shape as RDS — only pay the cold-start
-    # when there are services to bring back.
-    _ecs_state = load_state("ecs")
-    if _ecs_state and getattr(_ecs_state.get("services"), "_data", _ecs_state.get("services")):
-        _get_module("ecs")
-        logger.info("ECS: eager-loaded module to relaunch persisted services at boot")
+            try:
+                _get_module(module_name).load_persisted_state(data)
+                logger.info("Loaded persisted state for %s", state_key)
+            except Exception:
+                logger.exception(
+                    "Failed to restore persisted state for %s; continuing fresh",
+                    state_key,
+                )
 
 
 async def _wait_for_port(port, timeout=30):
