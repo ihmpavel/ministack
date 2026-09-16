@@ -243,6 +243,10 @@ def _ensure_live_containers():
     don't retry on every request — the cluster's metadata is still served
     but the endpoint won't be reachable (matches the old behavior, just no
     longer silent)."""
+    # A control-plane request must leave restored resources pending so a
+    # subsequent Docker-enabled request can provision their containers.
+    if _request_no_docker.get():
+        return
     # Cheap fast path — no lock needed when nothing's pending.
     if not (_pending_cluster_respawn or _pending_rg_respawn):
         return

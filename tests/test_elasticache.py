@@ -1547,6 +1547,15 @@ def test_elasticache_restore_state_marks_clusters_for_respawn(monkeypatch):
     assert spawned == []  # respawn deferred — _spawn_redis_container not yet bound at import time
     assert ("000000000000", "us-east-1", "clustertest") in _ec._pending_cluster_respawn
 
+    token = _ec._set_request_no_docker()
+    try:
+        _ec._ensure_live_containers()
+        assert spawned == []
+        assert ("000000000000", "us-east-1", "clustertest") in _ec._pending_cluster_respawn
+        assert _ec._clusters["clustertest"]["CacheNodes"][0]["Endpoint"]["Address"] == "stale"
+    finally:
+        _ec._reset_request_no_docker(token)
+
     _ec._ensure_live_containers()
 
     assert any(s["name"] == "ministack-elasticache-000000000000-us-east-1-clustertest" for s in spawned)
@@ -1581,6 +1590,14 @@ def test_elasticache_restore_state_wipes_stale_replication_group_container_ids(m
     })
     assert _ec._replication_groups["rg-1"]["_docker_container_ids"] == []
     assert ("000000000000", "us-east-1", "rg-1") in _ec._pending_rg_respawn
+
+    token = _ec._set_request_no_docker()
+    try:
+        _ec._ensure_live_containers()
+        assert ("000000000000", "us-east-1", "rg-1") in _ec._pending_rg_respawn
+        assert _ec._replication_groups["rg-1"]["_docker_container_ids"] == []
+    finally:
+        _ec._reset_request_no_docker(token)
 
     _ec._ensure_live_containers()
     cids = _ec._replication_groups["rg-1"]["_docker_container_ids"]

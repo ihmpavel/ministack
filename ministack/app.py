@@ -2282,10 +2282,20 @@ async def _dispatch_service_request(
     rds_module = None
     elasticache_no_docker_token = None
     elasticache_module = None
-    if headers.get("x-ministack-rds-no-docker", "").lower() in ("1", "true", "yes"):
+    # Test headers are opt-in on the server, including for local test runs.
+    allow_test_headers = os.environ.get("CI", "").lower() == "true"
+    if (
+        allow_test_headers
+        and service == "rds"
+        and headers.get("x-ministack-rds-no-docker", "").lower() in ("1", "true", "yes")
+    ):
         rds_module = _get_module("rds")
         rds_no_docker_token = rds_module._set_request_no_docker()
-    if headers.get("x-ministack-elasticache-no-docker", "").lower() in ("1", "true", "yes"):
+    if (
+        allow_test_headers
+        and service == "elasticache"
+        and headers.get("x-ministack-elasticache-no-docker", "").lower() in ("1", "true", "yes")
+    ):
         elasticache_module = _get_module("elasticache")
         elasticache_no_docker_token = elasticache_module._set_request_no_docker()
     try:

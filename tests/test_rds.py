@@ -1833,14 +1833,16 @@ def test_rds_handle_request_describe_with_json_body():
 
     set_request_account_id("111111111111")
     iid = f"inproc-json-{_uuid_mod.uuid4().hex[:12]}"
-    m._create_db_instance({
-        "DBInstanceIdentifier": [iid],
-        "DBInstanceClass": ["db.t3.micro"],
-        "Engine": ["postgres"],
-        "MasterUsername": ["admin"],
-        "MasterUserPassword": ["pw"],
-        "AllocatedStorage": ["20"],
-    })
+    m._instances[iid] = {
+        "DBInstanceIdentifier": iid,
+        "DBInstanceClass": "db.t3.micro",
+        "Engine": "postgres",
+        "EngineVersion": "16.3",
+        "MasterUsername": "admin",
+        "AllocatedStorage": 20,
+        "DBInstanceStatus": "available",
+        "DBInstanceArn": f"arn:aws:rds:us-east-1:111111111111:db:{iid}",
+    }
 
     async def desc():
         body = json.dumps({"DBInstanceIdentifier": iid}).encode()
@@ -1850,9 +1852,12 @@ def test_rds_handle_request_describe_with_json_body():
         }
         return await m.handle_request("POST", "/", hdrs, body, {})
 
-    status, _, xml = asyncio.run(desc())
-    assert status == 200
-    assert iid.encode() in xml
+    try:
+        status, _, xml = asyncio.run(desc())
+        assert status == 200
+        assert iid.encode() in xml
+    finally:
+        m._instances.pop(iid, None)
 
 
 def test_rds_flatten_json_request_params():
@@ -5004,6 +5009,16 @@ def test_rds_restore_state_respawns_docker_container(monkeypatch):
     monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
     monkeypatch.setattr(m, "_get_ministack_network", lambda c: None)
 
+    started_threads = []
+    _RealThread = threading.Thread
+
+    class TrackedThread(_RealThread):
+        def start(self):
+            started_threads.append(self)
+            super().start()
+
+    monkeypatch.setattr(m.threading, "Thread", TrackedThread)
+
     db_id = "respawn-test-db"
     persisted_state = {
         "instances": {db_id: {
@@ -5023,33 +5038,50 @@ def test_rds_restore_state_respawns_docker_container(monkeypatch):
     }
 
     m._instances.clear()
-    m.restore_state(persisted_state)
+    try:
+        m.restore_state(persisted_state)
 
-    deadline = time.time() + 5
-    while time.time() < deadline and not runs:
-        time.sleep(0.05)
+        deadline = time.time() + 5
+        settled = False
+        while time.time() < deadline:
+            restored = m._instances.get(db_id)
+            if restored and restored.get("DBInstanceStatus") == "available":
+                settled = True
+                break
+            time.sleep(0.05)
+        assert settled, "restore_state did not make the instance available"
 
-    assert runs, "restore_state did not respawn the Docker container"
-    assert runs[0]["name"] == m._rds_docker_name(db_id)
-    assert runs[0]["image"].endswith("postgres:16-alpine")
-    assert runs[0]["environment"]["POSTGRES_USER"] == "admin"
-    assert runs[0]["environment"]["POSTGRES_PASSWORD"] == "password123"
-    assert runs[0]["environment"]["POSTGRES_DB"] == "mydb"
-    # Subset: ownership labels (`ministack.instance` / `ministack.boot`) are
-    # also stamped so the reaper cannot cross instance boundaries.
-    assert {
-        "ministack": "rds",
-        "db_id": db_id,
-        "account_id": get_account_id(),
-        "region": get_region(),
-    }.items() <= runs[0]["labels"].items()
+        # The restore worker records the container before its final status
+        # update, so join it before asserting the complete restored state.
+        for thread in started_threads:
+            thread.join(timeout=10)
+        assert not any(t.is_alive() for t in started_threads), (
+            "restore_state background threads still running after the settle wait"
+        )
 
-    restored = m._instances.get(db_id)
-    assert restored is not None
-    assert restored["_docker_container_id"] == "cid-fake"
-    assert restored["DBInstanceStatus"] == "available"
+        assert runs, "restore_state did not respawn the Docker container"
+        assert runs[0]["name"] == m._rds_docker_name(db_id)
+        assert runs[0]["image"].endswith("postgres:16-alpine")
+        assert runs[0]["environment"]["POSTGRES_USER"] == "admin"
+        assert runs[0]["environment"]["POSTGRES_PASSWORD"] == "password123"
+        assert runs[0]["environment"]["POSTGRES_DB"] == "mydb"
+        # Subset: ownership labels (`ministack.instance` / `ministack.boot`) are
+        # also stamped so the reaper cannot cross instance boundaries.
+        assert {
+            "ministack": "rds",
+            "db_id": db_id,
+            "account_id": get_account_id(),
+            "region": get_region(),
+        }.items() <= runs[0]["labels"].items()
 
-    m._instances.clear()
+        restored = m._instances.get(db_id)
+        assert restored is not None
+        assert restored["_docker_container_id"] == "cid-fake"
+        assert restored["DBInstanceStatus"] == "available"
+    finally:
+        for thread in started_threads:
+            thread.join(timeout=10)
+        m._instances.pop(db_id, None)
 
 
 @pytest.mark.parametrize(
