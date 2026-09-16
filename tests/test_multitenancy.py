@@ -231,3 +231,15 @@ def test_apigateway_v1_stages_isolated_per_account():
     finally:
         try: a.delete_rest_api(restApiId=a_api)
         except Exception: pass
+
+def test_post_object_uses_the_account_from_the_form_credentials():
+    s3 = _client("s3", access_key="123456789012")
+    s3.create_bucket(Bucket="tenant-bucket")
+
+    post = s3.generate_presigned_post("tenant-bucket", "hello.txt")
+    response = requests.post(post["url"], data=post["fields"], files={"file": ("hello.txt", b"hi")})
+    assert response.status_code == 204
+
+    assert s3.get_object(Bucket="tenant-bucket", Key="hello.txt")["Body"].read() == b"hi"
+    with pytest.raises(ClientError):
+        _client("s3").head_object(Bucket="tenant-bucket", Key="hello.txt")
